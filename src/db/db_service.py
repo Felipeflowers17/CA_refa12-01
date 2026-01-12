@@ -624,19 +624,25 @@ class DbService:
                 "Puntos Productos": k.puntos_productos
             } for k in kws]
 
-    def exportar_config_organismos(self) -> List[Dict]:
+    def exportar_config_organismos(self, sector_filter: Optional[str] = None) -> List[Dict]:
         """
-        Retorna lista completa de organismos indicando su estado (Regla) y puntaje.
-        Incluye los Neutros (sin regla).
+        Retorna lista de organismos con su Regla, Puntaje y SECTOR.
+        Soporta filtrado por nombre de sector.
         """
         with self.session_factory() as session:
-            # Join izquierdo para traer organismos aunque no tengan regla
-            stmt = select(CaOrganismo, CaOrganismoRegla).outerjoin(
+            # Join con Reglas (Left) y con Sector (Inner/Left)
+            stmt = select(CaOrganismo, CaOrganismoRegla, CaSector).outerjoin(
                 CaOrganismoRegla, CaOrganismo.organismo_id == CaOrganismoRegla.organismo_id
+            ).join(
+                CaSector, CaOrganismo.sector_id == CaSector.sector_id
             ).order_by(CaOrganismo.nombre)
             
+            # Aplicar filtro si existe
+            if sector_filter and sector_filter != "Todos":
+                stmt = stmt.where(CaSector.nombre == sector_filter)
+
             resultados = []
-            for org, regla in session.execute(stmt):
+            for org, regla, sector in session.execute(stmt):
                 estado = "Neutro"
                 puntos = 0
                 if regla:
@@ -645,34 +651,142 @@ class DbService:
                         puntos = regla.puntos
                     elif regla.tipo == TipoReglaOrganismo.NO_DESEADO:
                         estado = "No Deseado"
-                        puntos = regla.puntos # Generalmente negativo
+                        puntos = regla.puntos 
                 
                 resultados.append({
                     "ID": org.organismo_id,
                     "Organismo": org.nombre,
+                    "Sector": sector.nombre,  # <--- NUEVO CAMPO IMPORTANTE
                     "Estado": estado,
                     "Puntos Asignados": puntos,
                     "Es Nuevo": "Sí" if org.es_nuevo else "No"
                 })
             return resultados
         
-    def agregar_palabra_clave_flexible(self, keyword: str, p_nom: int, p_desc: int, p_prod: int):
-        """Método compatible con la nueva GUI para guardar puntajes granulares."""
+    def agregar_palabra_clave_flexible(self, keyword: str, p_nom: int, p_desc: int, p_prod: int, categoria: str = None):
+        """Método actualizado para guardar también la categoría."""
         with self.session_factory() as session:
-            # Verificar si ya existe para no duplicar error
             existente = session.scalars(select(CaPalabraClave).filter_by(keyword=keyword.lower().strip())).first()
             if existente:
-                # Actualizamos la existente
                 existente.puntos_nombre = p_nom
                 existente.puntos_descripcion = p_desc
                 existente.puntos_productos = p_prod
+                existente.categoria = categoria # Actualizamos categoría
             else:
-                # Creamos una nueva
                 nuevo = CaPalabraClave(
                     keyword=keyword.lower().strip(),
                     puntos_nombre=p_nom,
                     puntos_descripcion=p_desc,
-                    puntos_productos=p_prod
+                    puntos_productos=p_prod,
+                    categoria=categoria # Guardamos categoría
                 )
                 session.add(nuevo)
+            session.commit()
+
+    def obtener_palabras_clave_por_categoria(self, categoria: Optional[str] = None) -> List[CaPalabraClave]:
+        """Retorna keywords filtradas. Si categoria es None, retorna todas."""
+        with self.session_factory() as session:
+            stmt = select(CaPalabraClave).order_by(CaPalabraClave.keyword)
+            
+            if categoria:
+                if categoria == "Sin Categoría":
+                    # Filtramos las que son NULL o vacías
+                    stmt = stmt.filter(or_(CaPalabraClave.categoria.is_(None), CaPalabraClave.categoria == ""))
+                else:
+                    stmt = stmt.filter(CaPalabraClave.categoria == categoria)
+            
+            return session.scalars(stmt).all()
+
+    def obtener_lista_categorias(self) -> List[str]:
+        """Retorna una lista única de categorías definidas por el usuario."""
+        with self.session_factory() as session:
+            # Seleccionamos categorías distintas que NO sean nulas ni vacías
+            # y que NO sean la cadena literal 'Sin Categoría' para evitar duplicados con el sistema
+            stmt = select(CaPalabraClave.categoria).distinct().where(
+                CaPalabraClave.categoria.isnot(None), 
+                CaPalabraClave.categoria != "",
+                CaPalabraClave.categoria != "Sin Categoría" 
+            ).order_by(CaPalabraClave.categoria)
+            
+            return list(session.scalars(stmt).all())
+        
+    def actualizar_palabra_clave(self, kw_id: int, keyword: str, p_nom: int, p_desc: int, p_prod: int, categoria: str):
+        """Actualiza una palabra clave existente por su ID."""
+        with self.session_factory() as session:
+            kw = session.get(CaPalabraClave, kw_id)
+            if kw:
+                kw.keyword = keyword.lower().strip()
+                kw.puntos_nombre = p_nom
+                kw.puntos_descripcion = p_desc
+                kw.puntos_productos = p_prod
+                kw.categoria = categoria
+                session.commit()
+
+    def renombrar_categoria(self, nombre_actual: str, nombre_nuevo: str):
+        """Busca todas las palabras con la categoría X y las mueve a Y."""
+        with self.session_factory() as session:
+            stmt = update(CaPalabraClave).where(CaPalabraClave.categoria == nombre_actual).values(categoria=nombre_nuevo)
+            session.execute(stmt)
+            session.commit()
+
+    def eliminar_categoria_completa(self, categoria: str):
+        """Elimina TODAS las palabras clave que pertenezcan a esta categoría."""
+        with self.session_factory() as session:
+            stmt = delete(CaPalabraClave).where(CaPalabraClave.categoria == categoria)
+            session.execute(stmt)
+            session.commit()
+    def obtener_lista_sectores(self) -> List[str]:
+        """Retorna lista única de nombres de sectores."""
+        with self.session_factory() as session:
+            stmt = select(CaSector.nombre).distinct().order_by(CaSector.nombre)
+            return list(session.scalars(stmt).all())
+
+    def mover_organismo_a_sector(self, org_id: int, nombre_sector: str):
+        """Mueve un organismo a un sector. Si el sector no existe, lo crea."""
+        with self.session_factory() as session:
+            # 1. Buscar o Crear Sector
+            sector = session.scalars(select(CaSector).filter_by(nombre=nombre_sector)).first()
+            if not sector:
+                sector = CaSector(nombre=nombre_sector)
+                session.add(sector)
+                session.flush() # Para obtener el ID
+            
+            # 2. Actualizar Organismo
+            org = session.get(CaOrganismo, org_id)
+            if org:
+                org.sector_id = sector.sector_id
+                session.commit()
+
+    def renombrar_sector(self, nombre_actual: str, nombre_nuevo: str):
+        """Actualiza el nombre de un sector existente."""
+        with self.session_factory() as session:
+            sector = session.scalars(select(CaSector).filter_by(nombre=nombre_actual)).first()
+            if sector:
+                sector.nombre = nombre_nuevo
+                session.commit()
+
+    def eliminar_sector(self, nombre_sector: str):
+        """
+        Elimina un sector.
+        ESTRATEGIA: Mueve todos los organismos al sector 'General' antes de borrar.
+        """
+        with self.session_factory() as session:
+            sector_a_borrar = session.scalars(select(CaSector).filter_by(nombre=nombre_sector)).first()
+            if not sector_a_borrar: return
+
+            # Asegurar Sector Destino (General)
+            sector_general = session.scalars(select(CaSector).filter_by(nombre="General")).first()
+            if not sector_general:
+                sector_general = CaSector(nombre="General")
+                session.add(sector_general)
+                session.flush()
+            
+            # Mover organismos
+            stmt_update = update(CaOrganismo).where(
+                CaOrganismo.sector_id == sector_a_borrar.sector_id
+            ).values(sector_id=sector_general.sector_id)
+            session.execute(stmt_update)
+            
+            # Borrar sector antiguo
+            session.delete(sector_a_borrar)
             session.commit()

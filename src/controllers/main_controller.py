@@ -159,8 +159,9 @@ class MainController:
         worker.finished_error.connect(on_err)
 
     # --- GESTIÓN DE PUNTAJES (ORGANISMOS) ---
-    def get_all_organisms_config(self):
-        return self.db_service.exportar_config_organismos()
+    def get_all_organisms_config(self, sector_filter=None):
+        """Retorna organismos, opcionalmente filtrados por sector."""
+        return self.db_service.exportar_config_organismos(sector_filter)
 
     def set_organism_rule(self, org_id: int, rule_type: str, points: int):
         if rule_type == 'neutro':
@@ -174,8 +175,9 @@ class MainController:
     def get_all_keywords(self):
         return self.db_service.exportar_config_keywords()
 
-    def add_keyword(self, text, p_title, p_desc, p_prod):
-        self.db_service.agregar_palabra_clave_flexible(text, p_title, p_desc, p_prod)
+    def add_keyword(self, text, p_title, p_desc, p_prod, category=None):
+        """Pasamanos actualizado."""
+        self.db_service.agregar_palabra_clave_flexible(text, p_title, p_desc, p_prod, category)
 
     def delete_keyword(self, keyword_id):
         self.db_service.eliminar_palabra_clave(keyword_id)
@@ -233,3 +235,48 @@ class MainController:
         self._conectar_worker(worker, on_progress, on_finish, on_error)
         worker.start()
         self._current_worker = worker
+
+    def get_keywords(self, category_filter=None):
+        """Obtiene keywords, opcionalmente filtradas por categoría."""
+        keywords = self.db_service.obtener_palabras_clave_por_categoria(category_filter)
+        # Convertimos a diccionarios para la vista
+        return [{
+            "ID": k.keyword_id,
+            "Palabra Clave": k.keyword,
+            "Categoría": k.categoria or "Sin Categoría", # Mostramos algo legible
+            "Puntos Título": k.puntos_nombre,
+            "Puntos Descripción": k.puntos_descripcion,
+            "Puntos Productos": k.puntos_productos
+        } for k in keywords]
+
+    def get_categories(self):
+        """Obtiene la lista de categorías únicas."""
+        return self.db_service.obtener_lista_categorias()
+    
+    def update_keyword(self, kw_id, text, p_title, p_desc, p_prod, category):
+        self.db_service.actualizar_palabra_clave(kw_id, text, p_title, p_desc, p_prod, category)
+
+    def rename_category(self, old_name, new_name):
+        self.db_service.renombrar_categoria(old_name, new_name)
+
+    def delete_category_full(self, category_name):
+        self.db_service.eliminar_categoria_completa(category_name)
+
+    
+    def get_sectors(self):
+        """Obtiene la lista de sectores disponibles."""
+        return self.db_service.obtener_lista_sectores()
+
+    def set_organism_sector(self, org_id, sector_name):
+        """Mueve un organismo a un nuevo sector."""
+        self.db_service.mover_organismo_a_sector(org_id, sector_name)
+
+    def rename_sector(self, old_name, new_name):
+        self.db_service.renombrar_sector(old_name, new_name)
+
+    def delete_sector(self, sector_name):
+        self.db_service.eliminar_sector(sector_name)
+
+
+
+

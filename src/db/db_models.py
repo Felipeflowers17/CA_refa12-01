@@ -118,6 +118,9 @@ class CaPalabraClave(Base):
     
     keyword_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     keyword: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+
+    # Permite agrupar palabras (ej: 'Insumos', 'Vehículos', 'Servicios')
+    categoria: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     
     # Configuración de puntos según dónde se encuentre la palabra
     puntos_nombre: Mapped[int] = mapped_column(Integer, default=0)
