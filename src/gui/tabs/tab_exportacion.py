@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QFileDialog, QLabel
 from qfluentwidgets import (
     CheckBox, PrimaryPushButton, FluentIcon as FIF, 
-    InfoBar, CardWidget, BodyLabel
+    InfoBar, CardWidget
 )
 
 class TabExportacion(QFrame):
@@ -13,7 +13,7 @@ class TabExportacion(QFrame):
         layout.setContentsMargins(30, 20, 30, 20)
         layout.setSpacing(20)
 
-        # --- Sección 1: Qué exportar [cite: 12] ---
+        # --- Sección 1: Qué exportar ---
         card_data = CardWidget(self)
         l_data = QVBoxLayout(card_data)
         l_data.addWidget(QLabel("1. Selecciona los datos:", self))
@@ -28,7 +28,7 @@ class TabExportacion(QFrame):
         l_data.addWidget(self.chk_rules)
         layout.addWidget(card_data)
 
-        # --- Sección 2: Formatos [cite: 13] ---
+        # --- Sección 2: Formatos ---
         card_fmt = CardWidget(self)
         l_fmt = QVBoxLayout(card_fmt)
         l_fmt.addWidget(QLabel("2. Selecciona formatos:", self))
@@ -50,28 +50,41 @@ class TabExportacion(QFrame):
         layout.addStretch()
 
     def iniciar_exportacion(self):
-        # 1. Validar selección
-        tasks = []
-        if self.chk_backup.isChecked(): tasks.append({"tipo": "bd_full"})
-        if self.chk_visible.isChecked(): tasks.append({"tipo": "tabs"})
-        if self.chk_rules.isChecked(): tasks.append({"tipo": "config"})
+        # 1. Identificar qué TIPOS de datos se seleccionaron
+        selected_types = []
+        if self.chk_backup.isChecked(): selected_types.append("bd_full")
+        if self.chk_visible.isChecked(): selected_types.append("tabs")
+        if self.chk_rules.isChecked(): selected_types.append("config")
         
-        if not tasks:
+        if not selected_types:
             InfoBar.warning("Atención", "Selecciona al menos un tipo de dato.", parent=self)
             return
 
-        # 2. Seleccionar Carpeta
+        # 2. Identificar qué FORMATOS se seleccionaron
+        selected_formats = []
+        if self.chk_excel.isChecked(): selected_formats.append("excel")
+        if self.chk_csv.isChecked(): selected_formats.append("csv")
+
+        if not selected_formats:
+            InfoBar.warning("Atención", "Selecciona al menos un formato (Excel o CSV).", parent=self)
+            return
+
+        # 3. Construir la lista de tareas (Combinatoria: Tipos x Formatos)
+        # Esto asegura que si marcas ambos, se generen ambas tareas.
+        tasks = []
+        for dtype in selected_types:
+            for fmt in selected_formats:
+                tasks.append({
+                    "tipo": dtype,
+                    "format": fmt
+                })
+
+        # 4. Seleccionar Carpeta
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar Carpeta de Destino")
         if not folder:
             return
 
-        # 3. Configurar formato para cada tarea
-        fmt = "excel" if self.chk_excel.isChecked() else "csv"
-        # Si ambos están marcados, priorizamos Excel en esta implementación simple, 
-        # o podríamos duplicar tareas. Por simplicidad del manual:
-        for t in tasks: t["format"] = fmt
-
-        # 4. Ejecutar
+        # 5. Ejecutar
         self.btn_export.setEnabled(False)
         self.controller.run_export_task(
             tasks, folder,

@@ -127,10 +127,18 @@ class MainController:
 
     # --- TAREAS EN SEGUNDO PLANO (Workers) ---
 
-    def run_extraction_task(self, config_dict, on_progress, on_finish, on_error):
-        """Ejecuta ETL completo en hilo secundario."""
-        worker = GenericWorker(self.etl_service.ejecutar_etl_completo, configuracion=config_dict)
-        self._conectar_worker(worker, on_progress, on_finish, on_error)
+    def run_export_task(self, export_tasks, output_path, on_finish, on_error):
+        """Ejecuta exportación Excel/CSV."""
+        
+        # --- CORRECCIÓN: Agregamos **kwargs ---
+        # GenericWorker siempre inyecta 'callback_texto' y 'callback_porcentaje'.
+        # Al poner **kwargs, la función acepta esos argumentos extra y los ignora sin romper.
+        def _wrapper_export(tasks, path, **kwargs):
+             return self.excel_service.ejecutar_exportacion_lote(tasks, path)
+        
+        worker = GenericWorker(_wrapper_export, tasks=export_tasks, path=output_path)
+        worker.finished_success.connect(on_finish)
+        worker.finished_error.connect(on_error)
         worker.start()
         self._current_worker = worker
 
@@ -141,16 +149,6 @@ class MainController:
         worker.start()
         self._current_worker = worker
 
-    def run_export_task(self, export_tasks, output_path, on_finish, on_error):
-        """Ejecuta exportación Excel/CSV."""
-        def _wrapper_export(tasks, path):
-             return self.excel_service.ejecutar_exportacion_lote(tasks, path)
-        
-        worker = GenericWorker(_wrapper_export, tasks=export_tasks, path=output_path)
-        worker.finished_success.connect(on_finish)
-        worker.finished_error.connect(on_error)
-        worker.start()
-        self._current_worker = worker
 
     def _conectar_worker(self, worker, on_prog, on_fin, on_err):
         worker.progress_text.connect(lambda t: on_prog(t, None))
@@ -276,6 +274,31 @@ class MainController:
 
     def delete_sector(self, sector_name):
         self.db_service.eliminar_sector(sector_name)
+
+    def run_extraction_task(self, config, on_progress, on_finish, on_error):
+        """
+        Ejecuta el scraping manual (Fase 1 + ETL) en segundo plano.
+        """
+        # GenericWorker inyectará automáticamente 'callback_texto' y 'callback_porcentaje'
+        # que coinciden con los argumentos esperados por ejecutar_etl_completo.
+        worker = GenericWorker(
+            self.etl_service.ejecutar_etl_completo, 
+            configuracion=config
+        )
+        
+        # Usamos el helper _conectar_worker si lo tienes, o conectamos manualmente
+        if hasattr(self, '_conectar_worker'):
+            self._conectar_worker(worker, on_progress, on_finish, on_error)
+        else:
+            # Conexión manual por si acaso no tienes el helper
+            if on_progress:
+                worker.progress_text.connect(lambda t: on_progress(t, None))
+                worker.progress_value.connect(lambda v: on_progress(None, v))
+            worker.finished_success.connect(on_finish)
+            worker.finished_error.connect(on_error)
+
+        worker.start()
+        self._current_worker = worker
 
 
 

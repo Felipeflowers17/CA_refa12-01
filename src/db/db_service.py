@@ -1,83 +1,105 @@
 # -*- coding: utf-8 -*-
-"""
-Servicio de Base de Datos (DbService).
-
-Este módulo actúa como la única puerta de enlace para todas las operaciones
-de persistencia de datos, encapsulando la lógica de SQLAlchemy.
-"""
-
-from typing import List, Dict, Tuple, Optional, Union, Set
-from datetime import date, datetime, timedelta
-from sqlalchemy.orm import sessionmaker, Session, joinedload
-from sqlalchemy import select, delete, or_, update, func, bindparam, and_, not_ 
-from sqlalchemy.dialects.postgresql import insert
-
-from .db_models import (
-    CaLicitacion,
-    CaSeguimiento,
-    CaOrganismo,
-    CaSector,
-    CaPalabraClave,
-    CaOrganismoRegla,
-    TipoReglaOrganismo
-)
+from typing import List, Dict, Tuple, Optional
+from sqlalchemy.orm import sessionmaker, Session
+from src.db.db_models import CaLicitacion
 from src.utils.logger import configurar_logger
 
+# Importamos los nuevos repositorios
+from src.db.repositories.keyword_repository import KeywordRepository
+from src.db.repositories.organismo_repository import OrganismoRepository
+from src.db.repositories.licitacion_repository import LicitacionRepository
+from src.db.repositories.etl_repository import EtlRepository
 
 logger = configurar_logger(__name__)
 
 class DbService:
-    """
-    Clase responsable de todas las transacciones con la base de datos.
-    Implementa el patrón Repository/DAO.
-    """
-    
     def __init__(self, session_factory: sessionmaker[Session]):
         self.session_factory = session_factory
-        logger.info("DbService inicializado correctamente.")
-
-    # --- MÉTODOS INTERNOS / AUXILIARES ---
-
-    def _preparar_mapa_organismos(self, session: Session, nombres_organismos: Set[str]) -> Dict[str, int]:
-        """
-        Verifica la existencia de organismos en la BD y crea los faltantes en lote.
-        Retorna un diccionario {nombre_organismo: id_organismo}.
-        """
-        if not nombres_organismos: 
-            return {}
-            
-        nombres_norm = {n.strip() for n in nombres_organismos if n}
         
-        # 1. Buscar existentes
-        stmt = select(CaOrganismo.nombre, CaOrganismo.organismo_id).where(CaOrganismo.nombre.in_(nombres_norm))
-        existentes = {nombre: oid for nombre, oid in session.execute(stmt).all()}
+        # Inicializamos los repositorios
+        self.keyword_repo = KeywordRepository(session_factory)
+        self.organismo_repo = OrganismoRepository(session_factory)
+        self.licitacion_repo = LicitacionRepository(session_factory)
+        self.etl_repo = EtlRepository(session_factory)
         
-        # 2. Identificar y crear faltantes
-        faltantes = nombres_norm - set(existentes.keys())
-        if faltantes:
-            # Obtener o crear un sector por defecto ("General")
-            sector_default = session.scalars(select(CaSector).limit(1)).first()
-            if not sector_default:
-                sector_default = CaSector(nombre="General")
-                session.add(sector_default)
-                session.flush()
-            
-            # Inserción masiva de nuevos organismos
-            nuevos_orgs = [{"nombre": nombre, "sector_id": sector_default.sector_id, "es_nuevo": True} for nombre in faltantes]
-            session.execute(insert(CaOrganismo), nuevos_orgs)
-            
-            # Recuperar los IDs recién creados
-            stmt_nuevos = select(CaOrganismo.nombre, CaOrganismo.organismo_id).where(CaOrganismo.nombre.in_(faltantes))
-            for nombre, oid in session.execute(stmt_nuevos).all():
-                existentes[nombre] = oid
-                
-        return existentes
+        logger.info("DbService (Fachada) inicializado con repositorios.")
+
+    # =========================================================================
+    # SECCIÓN 1: INGESTIÓN Y MANTENIMIENTO (Delega a EtlRepo)
+    # =========================================================================
+    
+    def insertar_o_actualizar_masivo(self, compras: List[Dict]):
+        self.etl_repo.insertar_o_actualizar_masivo(compras)
+
+    def actualizar_fase_2_detalle(self, codigo_ca: str, datos_fase_2: Dict, puntuacion_total: int, detalle_completo: List[str]):
+        self.etl_repo.actualizar_fase_2_detalle(codigo_ca, datos_fase_2, puntuacion_total, detalle_completo)
+
+    def actualizar_puntajes_en_lote(self, lista_actualizaciones: List[Tuple[int, int, List[str]]]):
+        self.etl_repo.actualizar_puntajes_en_lote(lista_actualizaciones)
+
+    def obtener_datos_para_recalculo_puntajes(self) -> List[Dict]:
+        return self.etl_repo.obtener_datos_recalculo()
+
+    def obtener_candidatas_para_fase_2(self, umbral_minimo: int = 10) -> List[CaLicitacion]:
+        return self.etl_repo.obtener_candidatas_fase_2(umbral_minimo)
+
+    def obtener_rango_fechas_candidatas_activas(self) -> Tuple[Optional[object], Optional[object]]:
+        return self.etl_repo.obtener_rango_fechas_activas()
+
+    def limpiar_registros_antiguos(self) -> int:
+        return self.etl_repo.limpiar_registros_antiguos()
+
+    def cerrar_licitaciones_vencidas_localmente(self) -> int:
+        return self.etl_repo.cerrar_vencidas_localmente()
+
+    def marcar_organismos_como_vistos(self):
+        self.organismo_repo.marcar_organismos_como_vistos()
+
+    # =========================================================================
+    # SECCIÓN 2: GESTIÓN DE LICITACIONES (Delega a LicitacionRepo)
+    # =========================================================================
+
+    def obtener_licitacion_por_id(self, ca_id: int):
+        return self.licitacion_repo.obtener_por_id(ca_id)
+
+    # --- Acciones del Usuario ---
+    def gestionar_favorito(self, ca_id: int, es_favorito: bool):
+        self.licitacion_repo.gestionar_favorito(ca_id, es_favorito)
+
+    def gestionar_ofertada(self, ca_id: int, es_ofertada: bool):
+        self.licitacion_repo.gestionar_ofertada(ca_id, es_ofertada)
+
+    def ocultar_licitacion(self, ca_id: int, ocultar: bool = True):
+        self.licitacion_repo.ocultar_licitacion(ca_id, ocultar)
+
+    def guardar_nota_usuario(self, ca_id: int, nota: str):
+        self.licitacion_repo.guardar_nota_usuario(ca_id, nota)
+
+    # --- Consultas para Exportación / UI ---
+    # Aquí mantenemos la conversión a diccionario para no romper el Controller
+    def exportar_candidatas(self) -> List[Dict]:
+        data = self.licitacion_repo.obtener_candidatas_filtradas()
+        return self._convertir_a_diccionario_seguro(data)
+
+    def exportar_seguimiento(self) -> List[Dict]:
+        data = self.licitacion_repo.obtener_seguimiento()
+        return self._convertir_a_diccionario_seguro(data)
+
+    def exportar_ofertadas(self) -> List[Dict]:
+        data = self.licitacion_repo.obtener_ofertadas()
+        return self._convertir_a_diccionario_seguro(data)
+    
+    def obtener_licitaciones_seguimiento(self):
+        # Necesario para el ETL service que pide objetos directos
+        return self.licitacion_repo.obtener_seguimiento()
+    
+    def obtener_licitaciones_ofertadas(self):
+        return self.licitacion_repo.obtener_ofertadas()
 
     def _convertir_a_diccionario_seguro(self, licitaciones: List[CaLicitacion]) -> List[Dict]:
-        """Convierte objetos SQLAlchemy a diccionarios planos."""
+        """Helper visual (se mantiene aquí porque es lógica de presentación)."""
         resultados = []
         for ca in licitaciones:
-            # Verificamos si tiene nota en la tabla de seguimiento
             tiene_nota = False
             if ca.seguimiento and ca.seguimiento.notas and ca.seguimiento.notas.strip():
                 tiene_nota = True
@@ -93,700 +115,72 @@ class DbService:
                 "estado_ca_texto": ca.estado_ca_texto,
                 "fecha_publicacion": ca.fecha_publicacion,
                 "fecha_cierre": ca.fecha_cierre,
-                "fecha_cierre_segundo_llamado": ca.fecha_cierre_segundo_llamado, # <--- IMPORTANTE
+                "fecha_cierre_segundo_llamado": ca.fecha_cierre_segundo_llamado,
                 "proveedores_cotizando": ca.proveedores_cotizando,
                 "productos_solicitados": str(ca.productos_solicitados) if ca.productos_solicitados else "",
                 "es_favorito": ca.seguimiento.es_favorito if ca.seguimiento else False,
                 "es_ofertada": ca.seguimiento.es_ofertada if ca.seguimiento else False,
-                "tiene_nota": tiene_nota,  # <--- NUEVO CAMPO
-                "monto_clp": ca.monto_clp # Asegurar que este campo viaje
+                "tiene_nota": tiene_nota,
+                "monto_clp": ca.monto_clp
             })
         return resultados
 
-    # --- INGESTIÓN DE DATOS (ETL) ---
+    # =========================================================================
+    # SECCIÓN 3: CONFIGURACIÓN (Delega a KeywordRepo y OrganismoRepo)
+    # =========================================================================
 
-    def insertar_o_actualizar_masivo(self, compras: List[Dict]):
-        """
-        Realiza un 'Bulk Upsert' (Inserción o Actualización Masiva) de licitaciones.
-        Utiliza características específicas de PostgreSQL para alto rendimiento.
-        """
-        if not compras: 
-            return
-        
-        logger.info(f"Iniciando carga masiva (Upsert) de {len(compras)} registros...")
-        
-        with self.session_factory() as session:
-            try:
-                # 1. Gestionar Organismos (Claves Foráneas)
-                nombres_orgs = {c.get("organismo", "No Especificado") for c in compras}
-                mapa_orgs = self._preparar_mapa_organismos(session, nombres_orgs)
-                
-                data_to_upsert = []
-                codigos_vistos = set()
-                
-                # 2. Preparar datos
-                for item in compras:
-                    codigo = item.get("codigo", item.get("id"))
-                    if not codigo or codigo in codigos_vistos: 
-                        continue
-                    codigos_vistos.add(codigo)
-                    
-                    # --- CORRECCIÓN AQUÍ: Manejo seguro de nulos ---
-                    org_raw = item.get("organismo")
-                    # Si org_raw es None o vacío, usamos "No Especificado"
-                    org_nombre = (org_raw if org_raw else "No Especificado").strip()
-                    # -----------------------------------------------
-                    
-                    record = {
-                        "codigo_ca": codigo,
-                        "nombre": item.get("nombre"),
-                        "monto_clp": item.get("monto_disponible_CLP"),
-                        "fecha_publicacion": item.get("fecha_publicacion"),
-                        "fecha_cierre": item.get("fecha_cierre"),
-                        "proveedores_cotizando": item.get("cantidad_provedores_cotizando"),
-                        "estado_ca_texto": item.get("estado"),
-                        "estado_convocatoria": item.get("estado_convocatoria"),
-                        "organismo_id": mapa_orgs.get(org_nombre),
-                    }
-                    data_to_upsert.append(record)
-                
-                if data_to_upsert:
-                    # 3. Ejecutar Upsert (PostgreSQL)
-                    # Si el código existe, actualiza SOLO los campos dinámicos
-                    stmt = insert(CaLicitacion).values(data_to_upsert)
-                    stmt = stmt.on_conflict_do_update(
-                        index_elements=['codigo_ca'],
-                        set_={
-                            "proveedores_cotizando": stmt.excluded.proveedores_cotizando,
-                            "estado_ca_texto": stmt.excluded.estado_ca_texto, 
-                            "fecha_cierre": stmt.excluded.fecha_cierre,       
-                            "estado_convocatoria": stmt.excluded.estado_convocatoria,
-                            "monto_clp": stmt.excluded.monto_clp
-                        }
-                    )
-                    session.execute(stmt)
-                    session.commit()
-                    logger.info("Carga Masiva completada exitosamente.")
-            except Exception as e:
-                logger.error(f"Error en Carga Masiva: {e}", exc_info=True)
-                session.rollback()
-                raise e
+    # --- Keywords ---
+    def obtener_todas_palabras_clave(self):
+        return self.keyword_repo.obtener_todas()
 
-    def actualizar_fase_2_detalle(self, codigo_ca: str, datos_fase_2: Dict, puntuacion_total: int, detalle_completo: List[str]):
-        """Actualiza una licitación individual con los datos profundos obtenidos en Fase 2."""
-        with self.session_factory() as session:
-            try:
-                stmt = select(CaLicitacion).where(CaLicitacion.codigo_ca == codigo_ca)
-                licitacion = session.scalars(stmt).first()
-                if not licitacion: 
-                    return
-                
-                licitacion.descripcion = datos_fase_2.get("descripcion")
-                licitacion.productos_solicitados = datos_fase_2.get("productos_solicitados")
-                licitacion.direccion_entrega = datos_fase_2.get("direccion_entrega")
-                licitacion.puntuacion_final = puntuacion_total
-                licitacion.plazo_entrega = datos_fase_2.get("plazo_entrega")
-                licitacion.puntaje_detalle = detalle_completo 
-                licitacion.fecha_cierre_segundo_llamado = datos_fase_2.get("fecha_cierre_p2")
-                
-                if datos_fase_2.get("estado"):
-                    licitacion.estado_ca_texto = datos_fase_2.get("estado")
-                if datos_fase_2.get("estado_convocatoria") is not None:
-                    licitacion.estado_convocatoria = datos_fase_2.get("estado_convocatoria")
-                
-                session.commit()
-            except Exception as e: 
-                logger.error(f"[Fase 2] Error actualizando {codigo_ca}: {e}")
-                session.rollback()
-                raise
+    def agregar_palabra_clave_flexible(self, keyword, p_nom, p_desc, p_prod, categoria=None):
+        self.keyword_repo.agregar(keyword, p_nom, p_desc, p_prod, categoria)
 
-    def actualizar_puntajes_en_lote(self, lista_actualizaciones: List[Tuple[int, int, List[str]]]):
-        """
-        Actualiza masivamente el puntaje y detalle de las licitaciones.
-        Utiliza SQLAlchemy Core 2.0 para máxima eficiencia (una sola query SQL).
-        
-        Args:
-            lista_actualizaciones: Lista de tuplas (ca_id, nuevo_puntaje, detalle_lista)
-        """
-        if not lista_actualizaciones:
-            return
+    def eliminar_palabra_clave(self, keyword_id):
+        self.keyword_repo.eliminar(keyword_id)
 
-        # 1. Preparamos los datos en formato de diccionario para bindparam
-        # Usamos prefijos 'b_' para diferenciar los parámetros de las columnas
-        datos_para_update = [
-            {
-                "b_ca_id": ca_id,
-                "b_puntuacion": puntaje,
-                "b_detalle": detalle  # SQLAlchemy serializará esto a JSON automáticamente
-            }
-            for ca_id, puntaje, detalle in lista_actualizaciones
-        ]
+    def obtener_palabras_clave_por_categoria(self, categoria=None):
+        return self.keyword_repo.obtener_por_categoria(categoria)
 
-        # 2. Definimos la sentencia SQL genérica
-        stmt = (
-            update(CaLicitacion)
-            .where(CaLicitacion.ca_id == bindparam("b_ca_id"))
-            .values(
-                puntuacion_final=bindparam("b_puntuacion"),
-                puntaje_detalle=bindparam("b_detalle")
-            )
-        )
+    def obtener_lista_categorias(self):
+        return self.keyword_repo.obtener_categorias_unicas()
 
-        # 3. Ejecutamos la transacción
-        # El session_factory crea una sesión, ejecuta y cierra automáticamente.
-        with self.session_factory() as session:
-            try:
-                session.connection().execute(stmt, datos_para_update)
-                session.commit()
-                logger.info(f"Actualizados {len(datos_para_update)} puntajes correctamente.")
-            except Exception as e:
-                session.rollback()
-                logger.error(f"Error en actualización masiva de puntajes: {e}")
-                raise e
-            
-    # --- CONSULTAS DE DATOS ---
+    def actualizar_palabra_clave(self, kw_id, keyword, p_nom, p_desc, p_prod, categoria):
+        self.keyword_repo.actualizar(kw_id, keyword, p_nom, p_desc, p_prod, categoria)
 
-    def obtener_licitacion_por_id(self, ca_id: int) -> Optional[CaLicitacion]:
-        with self.session_factory() as session:
-            stmt = select(CaLicitacion).options(
-                joinedload(CaLicitacion.organismo), 
-                joinedload(CaLicitacion.seguimiento)
-            ).where(CaLicitacion.ca_id == ca_id)
-            return session.scalars(stmt).first()
+    def renombrar_categoria(self, old_name, new_name):
+        self.keyword_repo.renombrar_categoria(old_name, new_name)
 
-    def obtener_rango_fechas_candidatas_activas(self) -> Tuple[Optional[datetime], Optional[datetime]]:
-        """
-        Retorna el rango de fechas de licitaciones candidatas activas.
-        Se usa para el 'Barrido de Listado'.
-        """
-        with self.session_factory() as session:
-            subq = select(CaSeguimiento.ca_id).where(or_(CaSeguimiento.es_favorito == True, CaSeguimiento.es_ofertada == True, CaSeguimiento.es_oculta == True))
-            
-            stmt = select(
-                func.min(CaLicitacion.fecha_publicacion),
-                func.max(CaLicitacion.fecha_publicacion)
-            ).filter(
-                CaLicitacion.ca_id.notin_(subq),
-                or_(
-                    CaLicitacion.estado_ca_texto.ilike('%Publicada%'),
-                    CaLicitacion.estado_ca_texto.ilike('%Segundo%')
-                )
-            )
-            return session.execute(stmt).first()
+    def eliminar_categoria_completa(self, categoria):
+        self.keyword_repo.eliminar_categoria_completa(categoria)
 
-    def limpiar_registros_antiguos(self) -> int:
-        """
-        Elimina licitaciones que NO sean favoritas/ofertadas,
-        que NO estén en estado 'Publicada',
-        y cuya fecha de cierre fue hace más de 30 días.
-        """
-        with self.session_factory() as session:
-            # Fecha de corte: Hoy hace 30 días
-            fecha_corte = date.today() - timedelta(days=30)
+    def exportar_config_keywords(self):
+        return self.keyword_repo.exportar_config()
 
-            # Lógica de eliminación:
-            # 1. No estar en seguimiento (es_favorito = False) ni ofertada
-            # 2. Estado NO es "Publicada" (es decir, Cerrada, Adjudicada, Desierta, etc.)
-            # 3. La fecha de referencia (cierre) es anterior a 30 días atrás.
-            
-            # Subquery para excluir las que están en seguimiento
-            # (Si tu modelo tiene relación directa, es más fácil filtrar así)
-            
-            criterios = and_(
-                # A. Que NO esté activa/publicada
-                not_(CaLicitacion.estado_ca_texto.ilike("%Publicada%")),
-                
-                # B. Que sea vieja (más de 30 días desde su cierre)
-                # Usamos COALESCE lógico: si tiene fecha 2, usa esa, si no, fecha 1
-                or_(
-                    and_(
-                        CaLicitacion.fecha_cierre_segundo_llamado.isnot(None),
-                        CaLicitacion.fecha_cierre_segundo_llamado < fecha_corte
-                    ),
-                    and_(
-                        CaLicitacion.fecha_cierre_segundo_llamado.is_(None),
-                        CaLicitacion.fecha_cierre < fecha_corte
-                    )
-                ),
-                
-                # C. PROTECCIÓN CRÍTICA: Que NO sea favorita ni ofertada
-                # Verificamos la relación con CaSeguimiento
-                ~CaLicitacion.seguimiento.has(CaSeguimiento.es_favorito == True),
-                ~CaLicitacion.seguimiento.has(CaSeguimiento.es_ofertada == True)
-            )
+    # --- Organismos ---
+    def obtener_todos_organismos(self):
+        return self.organismo_repo.obtener_todos()
 
-            # Ejecutar borrado
-            eliminadas = session.query(CaLicitacion).filter(criterios).delete(synchronize_session=False)
-            
-            if eliminadas > 0:
-                session.commit()
-                # VACUUM manual si fuera SQLite muy grande, pero commit basta por ahora
-            
-            return eliminadas
-    
-    def cerrar_licitaciones_vencidas_localmente(self) -> int:
-        """
-        Cierra licitaciones que sigan marcadas como 'Publicada' pero 
-        cuya fecha de cierre + 14 DÍAS ya pasó.
-        Prioriza la fecha del 2do llamado si existe.
-        """
-        with self.session_factory() as session:
-            # Calculamos la fecha límite: Hoy hace 14 días.
-            # Si la licitación cerró ANTES de esta fecha, entonces ya pasaron los 14 días de gracia.
-            fecha_limite = date.today() - timedelta(days=14)
-            
-            # Filtro Lógico:
-            # 1. Estado es "Publicada"
-            # 2. Y ( (Tiene fecha 2do llamado y es vieja) O (No tiene 2do llamado y fecha 1 es vieja) )
-            filtro_vencimiento = or_(
-                and_(
-                    CaLicitacion.fecha_cierre_segundo_llamado.isnot(None),
-                    CaLicitacion.fecha_cierre_segundo_llamado < fecha_limite
-                ),
-                and_(
-                    CaLicitacion.fecha_cierre_segundo_llamado.is_(None),
-                    CaLicitacion.fecha_cierre < fecha_limite
-                )
-            )
+    def obtener_reglas_organismos(self):
+        return self.organismo_repo.obtener_reglas()
 
-            registros = session.query(CaLicitacion).filter(
-                CaLicitacion.estado_ca_texto.ilike("%Publicada%"),
-                filtro_vencimiento
-            ).all()
+    def establecer_regla_organismo(self, org_id, rule_type, points):
+        self.organismo_repo.establecer_regla(org_id, rule_type, points)
 
-            count = 0
-            for lic in registros:
-                lic.estado_ca_texto = "Cerrada (Vencida Local)"
-                count += 1
-            
-            if count > 0:
-                session.commit()
-            return count
+    def eliminar_regla_organismo(self, org_id):
+        self.organismo_repo.eliminar_regla(org_id)
 
-    def obtener_datos_para_recalculo_puntajes(self) -> List[Dict]:
-        """Obtiene datos ligeros de todas las licitaciones para recalcular puntajes."""
-        with self.session_factory() as session:
-            stmt = select(
-                CaLicitacion.ca_id, 
-                CaLicitacion.codigo_ca, 
-                CaLicitacion.nombre,
-                CaLicitacion.estado_ca_texto, 
-                CaLicitacion.descripcion, 
-                CaLicitacion.productos_solicitados,
-                CaLicitacion.puntuacion_final, 
-                CaOrganismo.nombre.label("organismo_nombre")
-            ).outerjoin(CaOrganismo, CaLicitacion.organismo_id == CaOrganismo.organismo_id)
-            rows = session.execute(stmt).all()
-            return [{
-                "ca_id": r.ca_id, 
-                "codigo_ca": r.codigo_ca, 
-                "nombre": r.nombre,
-                "estado_ca_texto": r.estado_ca_texto, 
-                "organismo_nombre": r.organismo_nombre or "",
-                "descripcion": r.descripcion, 
-                "productos_solicitados": r.productos_solicitados,
-                "puntuacion_final_actual": r.puntuacion_final or 0 
-            } for r in rows]
+    def exportar_config_organismos(self, sector_filter=None):
+        return self.organismo_repo.exportar_config(sector_filter)
 
-    def obtener_candidatas_para_fase_2(self, umbral_minimo: int = 10) -> List[CaLicitacion]:
-        """Devuelve licitaciones con buen puntaje que aun no tienen descripción (falta Fase 2)."""
-        with self.session_factory() as session:
-            stmt = select(CaLicitacion).filter(
-                CaLicitacion.puntuacion_final >= umbral_minimo, 
-                CaLicitacion.descripcion.is_(None)
-            ).order_by(CaLicitacion.fecha_cierre.asc())
-            return session.scalars(stmt).all()
+    def obtener_lista_sectores(self):
+        return self.organismo_repo.obtener_sectores()
 
-    def obtener_candidatas_filtradas(self, umbral_minimo: int = 5) -> List[CaLicitacion]:
-        """
-        Retorna licitaciones para la pestaña 'Candidatas'.
-        Excluye las que ya están en seguimiento/ofertadas y aplica filtros de estado.
-        """
-        with self.session_factory() as session:
-            # 1. Subquery de exclusión 
-            subq = select(CaSeguimiento.ca_id).where(
-                or_(
-                    CaSeguimiento.es_favorito == True, 
-                    CaSeguimiento.es_ofertada == True, 
-                    CaSeguimiento.es_oculta == True
-                )
-            )
-            
-            # 2. Query Principal
-            stmt = select(CaLicitacion).options(
-                joinedload(CaLicitacion.seguimiento), 
-                joinedload(CaLicitacion.organismo).joinedload(CaOrganismo.sector)
-            ).filter(
-                CaLicitacion.puntuacion_final >= umbral_minimo, 
-                CaLicitacion.ca_id.notin_(subq),
-                or_(
-                    CaLicitacion.estado_ca_texto == 'Publicada',
-                    CaLicitacion.estado_ca_texto == 'Publicada - Segundo llamado'
-                )
-            ).order_by(CaLicitacion.puntuacion_final.desc())
-            
-            return session.scalars(stmt).all()
+    def mover_organismo_a_sector(self, org_id, sector_name):
+        self.organismo_repo.mover_a_sector(org_id, sector_name)
 
-    def obtener_licitaciones_seguimiento(self) -> List[CaLicitacion]:
-        """Retorna licitaciones marcadas como 'Favoritas'."""
-        with self.session_factory() as session:
-            stmt = select(CaLicitacion).options(
-                joinedload(CaLicitacion.seguimiento), 
-                joinedload(CaLicitacion.organismo).joinedload(CaOrganismo.sector)
-            ).join(CaSeguimiento, CaLicitacion.ca_id == CaSeguimiento.ca_id).filter(
-                CaSeguimiento.es_favorito == True, 
-                CaSeguimiento.es_ofertada == False
-            ).order_by(CaLicitacion.fecha_cierre.asc())
-            return session.scalars(stmt).all()
+    def renombrar_sector(self, old_name, new_name):
+        self.organismo_repo.renombrar_sector(old_name, new_name)
 
-    def obtener_licitaciones_ofertadas(self) -> List[CaLicitacion]:
-        """Retorna licitaciones marcadas como 'Ofertadas'."""
-        with self.session_factory() as session:
-            stmt = select(CaLicitacion).options(
-                joinedload(CaLicitacion.seguimiento), 
-                joinedload(CaLicitacion.organismo).joinedload(CaOrganismo.sector)
-            ).join(CaSeguimiento, CaLicitacion.ca_id == CaSeguimiento.ca_id).filter(
-                CaSeguimiento.es_ofertada == True
-            ).order_by(CaLicitacion.fecha_cierre.asc())
-            return session.scalars(stmt).all()
-
-    # --- ACCIONES DEL USUARIO ---
-
-    def gestionar_favorito(self, ca_id: int, es_favorito: bool): 
-        self._actualizar_estado_seguimiento(ca_id, es_favorito=es_favorito, es_ofertada=None)
-        
-    def gestionar_ofertada(self, ca_id: int, es_ofertada: bool): 
-        self._actualizar_estado_seguimiento(ca_id, es_favorito=None, es_ofertada=es_ofertada)
-
-    def _actualizar_estado_seguimiento(self, ca_id: int, es_favorito: Optional[bool] = None, es_ofertada: Optional[bool] = None):
-        with self.session_factory() as session:
-            try:
-                seguimiento = session.get(CaSeguimiento, ca_id)
-                if seguimiento:
-                    if es_favorito is not None: 
-                        seguimiento.es_favorito = es_favorito
-                    if es_ofertada is not None: 
-                        seguimiento.es_ofertada = es_ofertada
-                    # Si ofertamos, automáticamente es favorita
-                    if es_ofertada: 
-                        seguimiento.es_favorito = True
-                elif es_favorito or es_ofertada:
-                    nuevo = CaSeguimiento(
-                        ca_id=ca_id, 
-                        es_favorito=es_favorito or es_ofertada, 
-                        es_ofertada=es_ofertada if es_ofertada is not None else False
-                    )
-                    session.add(nuevo)
-                session.commit()
-            except Exception as e: 
-                logger.error(f"Error actualizando seguimiento {ca_id}: {e}")
-                session.rollback()
-
-    def ocultar_licitacion(self, ca_id: int, ocultar: bool = True):
-        with self.session_factory() as session:
-            try:
-                seguimiento = session.get(CaSeguimiento, ca_id)
-                if seguimiento:
-                    seguimiento.es_oculta = ocultar
-                    if ocultar: 
-                        seguimiento.es_favorito = False
-                        seguimiento.es_ofertada = False
-                else:
-                    nuevo = CaSeguimiento(ca_id=ca_id, es_oculta=ocultar)
-                    session.add(nuevo)
-                session.commit()
-            except Exception as e: 
-                logger.error(f"Error ocultando licitación {ca_id}: {e}")
-                session.rollback()
-
-    def guardar_nota_usuario(self, ca_id: int, nota: str):
-        with self.session_factory() as session:
-            try:
-                seguimiento = session.get(CaSeguimiento, ca_id)
-                if seguimiento: 
-                    seguimiento.notas = nota
-                else: 
-                    nuevo = CaSeguimiento(ca_id=ca_id, notas=nota)
-                    session.add(nuevo)
-                session.commit()
-            except Exception as e: 
-                logger.error(f"Error guardando nota {ca_id}: {e}")
-                session.rollback()
-
-    def marcar_organismos_como_vistos(self):
-        """
-        Rutina de mantenimiento:
-        Toma todos los organismos marcados como 'Nuevos' y los pasa a estado normal (Visto).
-        Se ejecuta al inicio de cada scraping para 'limpiar' la bandeja de pendientes.
-        """
-        with self.session_factory() as session:
-            try:
-                # Actualizar todos los que tengan es_nuevo=True a False
-                stmt = update(CaOrganismo).where(CaOrganismo.es_nuevo == True).values(es_nuevo=False)
-                session.execute(stmt)
-                session.commit()
-            except Exception as e:
-                logger.error(f"Error reseteando organismos nuevos: {e}")
-                session.rollback()
-
-    # --- CONFIGURACIÓN DE REGLAS ---
-
-    def obtener_todas_palabras_clave(self) -> List[CaPalabraClave]:
-        with self.session_factory() as session: 
-            return session.scalars(select(CaPalabraClave).order_by(CaPalabraClave.keyword)).all()
-
-    def agregar_palabra_clave(self, keyword: str, tipo: str, puntos: int) -> CaPalabraClave:
-        with self.session_factory() as session:
-            nuevo = CaPalabraClave(keyword=keyword.lower().strip())
-            if tipo in ["titulo_pos", "titulo_neg"]: 
-                nuevo.puntos_nombre = puntos
-                nuevo.puntos_descripcion = puntos 
-            elif tipo == "producto": 
-                nuevo.puntos_productos = puntos
-            
-            session.add(nuevo)
-            session.commit()
-            session.refresh(nuevo) 
-            return nuevo
-
-    def eliminar_palabra_clave(self, keyword_id: int):
-        with self.session_factory() as session: 
-            session.query(CaPalabraClave).filter_by(keyword_id=keyword_id).delete()
-            session.commit()
-
-    def obtener_reglas_organismos(self) -> List[CaOrganismoRegla]:
-        with self.session_factory() as session: 
-            return session.scalars(select(CaOrganismoRegla).options(joinedload(CaOrganismoRegla.organismo))).all()
-
-    def establecer_regla_organismo(self, org_id: int, rule_type: str, points: int):
-        """Crea o actualiza una regla para un organismo específico."""
-        
-        # Blindaje: Forzar mayúsculas (PRIORITARIO, NO_DESEADO, etc.)
-        rule_type = str(rule_type).upper() 
-
-        with self.session_factory() as session:
-            # Importamos la clase correcta
-            from src.db.db_models import CaOrganismoRegla 
-
-            # Buscamos la regla existente
-            regla = session.query(CaOrganismoRegla).filter_by(organismo_id=org_id).first()
-            
-            if regla:
-                # Actualizar usando los nombres CORRECTOS de las columnas
-                regla.tipo = rule_type
-                regla.puntos = points
-            else:
-                # Crear nueva usando los nombres CORRECTOS de las columnas
-                nueva_regla = CaOrganismoRegla(
-                    organismo_id=org_id,
-                    tipo=rule_type,      # <--- Nombre correcto
-                    puntos=points        # <--- Nombre correcto
-                )
-                session.add(nueva_regla)
-            
-            session.commit()
-
-    def eliminar_regla_organismo(self, organismo_id: int):
-        with self.session_factory() as session:
-            stmt = select(CaOrganismoRegla).where(CaOrganismoRegla.organismo_id == organismo_id)
-            regla = session.scalars(stmt).first()
-            if regla: 
-                session.delete(regla)
-                session.commit()
-
-    def obtener_todos_organismos(self) -> List[CaOrganismo]:
-        with self.session_factory() as session: 
-            return session.scalars(select(CaOrganismo).order_by(CaOrganismo.nombre)).all()
-        
-    def _ejecutar_exportacion(self, metodo_obtencion, **kwargs) -> List[Dict]:
-        registros = metodo_obtencion(**kwargs)
-        return self._convertir_a_diccionario_seguro(registros)
-            
-    # --- EXPORTACIÓN PARA EXCEL ---
-    def exportar_candidatas(self) -> List[Dict]:
-        return self._ejecutar_exportacion(self.obtener_candidatas_filtradas, umbral_minimo=0)
-
-    def exportar_seguimiento(self) -> List[Dict]:
-        return self._ejecutar_exportacion(self.obtener_licitaciones_seguimiento)
-
-    def exportar_ofertadas(self) -> List[Dict]:
-        return self._ejecutar_exportacion(self.obtener_licitaciones_ofertadas)
-        
-    def exportar_config_keywords(self) -> List[Dict]:
-        """Retorna lista de diccionarios con todas las keywords y sus puntajes."""
-        with self.session_factory() as session:
-            kws = session.scalars(select(CaPalabraClave).order_by(CaPalabraClave.keyword)).all()
-            return [{
-                "ID": k.keyword_id,
-                "Palabra Clave": k.keyword,
-                "Puntos Título": k.puntos_nombre,
-                "Puntos Descripción": k.puntos_descripcion,
-                "Puntos Productos": k.puntos_productos
-            } for k in kws]
-
-    def exportar_config_organismos(self, sector_filter: Optional[str] = None) -> List[Dict]:
-        """
-        Retorna lista de organismos con su Regla, Puntaje y SECTOR.
-        Soporta filtrado por nombre de sector.
-        """
-        with self.session_factory() as session:
-            # Join con Reglas (Left) y con Sector (Inner/Left)
-            stmt = select(CaOrganismo, CaOrganismoRegla, CaSector).outerjoin(
-                CaOrganismoRegla, CaOrganismo.organismo_id == CaOrganismoRegla.organismo_id
-            ).join(
-                CaSector, CaOrganismo.sector_id == CaSector.sector_id
-            ).order_by(CaOrganismo.nombre)
-            
-            # Aplicar filtro si existe
-            if sector_filter and sector_filter != "Todos":
-                stmt = stmt.where(CaSector.nombre == sector_filter)
-
-            resultados = []
-            for org, regla, sector in session.execute(stmt):
-                estado = "Neutro"
-                puntos = 0
-                if regla:
-                    if regla.tipo == TipoReglaOrganismo.PRIORITARIO:
-                        estado = "Prioritario"
-                        puntos = regla.puntos
-                    elif regla.tipo == TipoReglaOrganismo.NO_DESEADO:
-                        estado = "No Deseado"
-                        puntos = regla.puntos 
-                
-                resultados.append({
-                    "ID": org.organismo_id,
-                    "Organismo": org.nombre,
-                    "Sector": sector.nombre,  # <--- NUEVO CAMPO IMPORTANTE
-                    "Estado": estado,
-                    "Puntos Asignados": puntos,
-                    "Es Nuevo": "Sí" if org.es_nuevo else "No"
-                })
-            return resultados
-        
-    def agregar_palabra_clave_flexible(self, keyword: str, p_nom: int, p_desc: int, p_prod: int, categoria: str = None):
-        """Método actualizado para guardar también la categoría."""
-        with self.session_factory() as session:
-            existente = session.scalars(select(CaPalabraClave).filter_by(keyword=keyword.lower().strip())).first()
-            if existente:
-                existente.puntos_nombre = p_nom
-                existente.puntos_descripcion = p_desc
-                existente.puntos_productos = p_prod
-                existente.categoria = categoria # Actualizamos categoría
-            else:
-                nuevo = CaPalabraClave(
-                    keyword=keyword.lower().strip(),
-                    puntos_nombre=p_nom,
-                    puntos_descripcion=p_desc,
-                    puntos_productos=p_prod,
-                    categoria=categoria # Guardamos categoría
-                )
-                session.add(nuevo)
-            session.commit()
-
-    def obtener_palabras_clave_por_categoria(self, categoria: Optional[str] = None) -> List[CaPalabraClave]:
-        """Retorna keywords filtradas. Si categoria es None, retorna todas."""
-        with self.session_factory() as session:
-            stmt = select(CaPalabraClave).order_by(CaPalabraClave.keyword)
-            
-            if categoria:
-                if categoria == "Sin Categoría":
-                    # Filtramos las que son NULL o vacías
-                    stmt = stmt.filter(or_(CaPalabraClave.categoria.is_(None), CaPalabraClave.categoria == ""))
-                else:
-                    stmt = stmt.filter(CaPalabraClave.categoria == categoria)
-            
-            return session.scalars(stmt).all()
-
-    def obtener_lista_categorias(self) -> List[str]:
-        """Retorna una lista única de categorías definidas por el usuario."""
-        with self.session_factory() as session:
-            # Seleccionamos categorías distintas que NO sean nulas ni vacías
-            # y que NO sean la cadena literal 'Sin Categoría' para evitar duplicados con el sistema
-            stmt = select(CaPalabraClave.categoria).distinct().where(
-                CaPalabraClave.categoria.isnot(None), 
-                CaPalabraClave.categoria != "",
-                CaPalabraClave.categoria != "Sin Categoría" 
-            ).order_by(CaPalabraClave.categoria)
-            
-            return list(session.scalars(stmt).all())
-        
-    def actualizar_palabra_clave(self, kw_id: int, keyword: str, p_nom: int, p_desc: int, p_prod: int, categoria: str):
-        """Actualiza una palabra clave existente por su ID."""
-        with self.session_factory() as session:
-            kw = session.get(CaPalabraClave, kw_id)
-            if kw:
-                kw.keyword = keyword.lower().strip()
-                kw.puntos_nombre = p_nom
-                kw.puntos_descripcion = p_desc
-                kw.puntos_productos = p_prod
-                kw.categoria = categoria
-                session.commit()
-
-    def renombrar_categoria(self, nombre_actual: str, nombre_nuevo: str):
-        """Busca todas las palabras con la categoría X y las mueve a Y."""
-        with self.session_factory() as session:
-            stmt = update(CaPalabraClave).where(CaPalabraClave.categoria == nombre_actual).values(categoria=nombre_nuevo)
-            session.execute(stmt)
-            session.commit()
-
-    def eliminar_categoria_completa(self, categoria: str):
-        """Elimina TODAS las palabras clave que pertenezcan a esta categoría."""
-        with self.session_factory() as session:
-            stmt = delete(CaPalabraClave).where(CaPalabraClave.categoria == categoria)
-            session.execute(stmt)
-            session.commit()
-    def obtener_lista_sectores(self) -> List[str]:
-        """Retorna lista única de nombres de sectores."""
-        with self.session_factory() as session:
-            stmt = select(CaSector.nombre).distinct().order_by(CaSector.nombre)
-            return list(session.scalars(stmt).all())
-
-    def mover_organismo_a_sector(self, org_id: int, nombre_sector: str):
-        """Mueve un organismo a un sector. Si el sector no existe, lo crea."""
-        with self.session_factory() as session:
-            # 1. Buscar o Crear Sector
-            sector = session.scalars(select(CaSector).filter_by(nombre=nombre_sector)).first()
-            if not sector:
-                sector = CaSector(nombre=nombre_sector)
-                session.add(sector)
-                session.flush() # Para obtener el ID
-            
-            # 2. Actualizar Organismo
-            org = session.get(CaOrganismo, org_id)
-            if org:
-                org.sector_id = sector.sector_id
-                session.commit()
-
-    def renombrar_sector(self, nombre_actual: str, nombre_nuevo: str):
-        """Actualiza el nombre de un sector existente."""
-        with self.session_factory() as session:
-            sector = session.scalars(select(CaSector).filter_by(nombre=nombre_actual)).first()
-            if sector:
-                sector.nombre = nombre_nuevo
-                session.commit()
-
-    def eliminar_sector(self, nombre_sector: str):
-        """
-        Elimina un sector.
-        ESTRATEGIA: Mueve todos los organismos al sector 'General' antes de borrar.
-        """
-        with self.session_factory() as session:
-            sector_a_borrar = session.scalars(select(CaSector).filter_by(nombre=nombre_sector)).first()
-            if not sector_a_borrar: return
-
-            # Asegurar Sector Destino (General)
-            sector_general = session.scalars(select(CaSector).filter_by(nombre="General")).first()
-            if not sector_general:
-                sector_general = CaSector(nombre="General")
-                session.add(sector_general)
-                session.flush()
-            
-            # Mover organismos
-            stmt_update = update(CaOrganismo).where(
-                CaOrganismo.sector_id == sector_a_borrar.sector_id
-            ).values(sector_id=sector_general.sector_id)
-            session.execute(stmt_update)
-            
-            # Borrar sector antiguo
-            session.delete(sector_a_borrar)
-            session.commit()
+    def eliminar_sector(self, sector_name):
+        self.organismo_repo.eliminar_sector(sector_name)
